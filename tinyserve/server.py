@@ -233,6 +233,7 @@ def build_app(aengine: AsyncEngine, model_name: str) -> FastAPI:
             "tinyserve_prompt_tokens_total": s.prompt_tokens,
             "tinyserve_generation_tokens_total": s.generated_tokens,
             "tinyserve_engine_steps_total": s.steps,
+            "tinyserve_mixed_steps_total": s.mixed_steps,
         }
         return PlainTextResponse("".join(f"{k} {v}\n" for k, v in lines.items()))
 
@@ -250,12 +251,14 @@ def main():
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--no-prefix-caching", action="store_true")
     ap.add_argument("--enforce-eager", action="store_true")
+    ap.add_argument("--no-overlap-schedule", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     engine = LLMEngine(EngineConfig(
         model=a.model, max_model_len=a.max_model_len, max_num_seqs=a.max_num_seqs,
         max_num_batched_tokens=a.max_num_batched_tokens, gpu_memory_utilization=a.gpu_memory_utilization,
         enable_prefix_caching=not a.no_prefix_caching, enforce_eager=a.enforce_eager,
+        enable_overlap_schedule=not a.no_overlap_schedule,
     ))
     app = build_app(AsyncEngine(engine), a.model)
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")

@@ -33,13 +33,14 @@ def run_tinyserve(args, work):
 
     llm = LLM(args.model, max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
               max_num_batched_tokens=args.max_num_batched_tokens, gpu_memory_utilization=args.gpu_util,
-              enable_prefix_caching=not args.no_prefix_caching, enforce_eager=args.enforce_eager)
+              enable_prefix_caching=not args.no_prefix_caching, enforce_eager=args.enforce_eager,
+              enable_overlap_schedule=not args.no_overlap_schedule)
     params = [SamplingParams(temperature=0, max_tokens=o, ignore_eos=True) for _, o in work]
     llm.generate([p for p, _ in work[:4]], params[:4], use_tqdm=False)  # warm-up
     t0 = time.perf_counter()
     outs = llm.generate([p for p, _ in work], params)
     dt = time.perf_counter() - t0
-    extra = {"preemptions": llm.engine.scheduler.num_preemptions,
+    extra = {"preemptions": llm.engine.scheduler.num_preemptions, "overlap": not args.no_overlap_schedule,
              "kv_blocks": llm.engine.block_manager.num_blocks}
     return dt, sum(len(o["token_ids"]) for o in outs), extra
 
@@ -99,6 +100,7 @@ def main():
     ap.add_argument("--gpu-util", type=float, default=0.85)
     ap.add_argument("--no-prefix-caching", action="store_true")
     ap.add_argument("--enforce-eager", action="store_true")
+    ap.add_argument("--no-overlap-schedule", action="store_true")
     ap.add_argument("--hf-batch", type=int, default=32)
     ap.add_argument("--out", default=None, help="append a JSON line with the result to this file")
     a = ap.parse_args()

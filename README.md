@@ -40,10 +40,35 @@ tokens, Qwen3-0.6B ([`prefix.jsonl`](benchmarks/results/prefix.jsonl)):
 | 32 | tinyserve | 13.42 | 33.2 / 2800 | 23.3 / 27.8 | 64.3 |
 | 32 | vLLM | 15.79 | 69.8 / 1761 | 18.6 / 25.6 | 52.1 |
 
-Offline throughput is on par with vLLM. Online, tinyserve has the lower median TTFT (new prompts are scheduled
-first) but its TPOT falls behind from ~16 req/s, because every step is either all-prefill or all-decode: each
-arriving prompt stalls all running decodes for one step. vLLM V1 mixes both in one token budget — that is the
-first item on the roadmap.
+These two tables were measured with the original prefill-first scheduler, where every step was either all-prefill
+or all-decode, so each arriving prompt stalled all running decodes for one step and TPOT fell behind vLLM from
+~16 req/s. The mixed-step + overlap scheduler below fixes that.
+
+**Mixed prefill/decode steps + overlap scheduling** — same-day A/B on the same GPU, Qwen3-0.6B. "baseline" is
+the earlier prefill-first, synchronous engine; "mixed only" is the new scheduler with `--no-overlap-schedule`
+(raw: [`serving_v2.jsonl`](benchmarks/results/serving_v2.jsonl),
+[`throughput_v2.jsonl`](benchmarks/results/throughput_v2.jsonl)):
+
+| req/s | engine | achieved req/s | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | ITL p99 (ms) |
+|---|---|---|---|---|---|
+| 8 | baseline | 7.10 | 23.0 / 46.6 | 6.1 / 7.5 | 21.7 |
+| 8 | mixed only | 7.00 | 26.9 / 56.7 | 7.3 / 8.7 | 22.1 |
+| 8 | **mixed + overlap** | 7.20 | 27.3 / 49.7 | **4.7 / 5.5** | **15.8** |
+| 16 | baseline | 10.98 | 29.1 / 81.0 | 15.7 / 22.2 | 54.2 |
+| 16 | mixed only | 9.70 | 56.7 / 151.1 | 23.6 / 28.3 | 64.2 |
+| 16 | **mixed + overlap** | **12.78** | 37.3 / 76.1 | **7.8 / 9.6** | **24.1** |
+| 32 | baseline | 11.47 | 64.2 / 4800 | 29.1 / 34.1 | 81.0 |
+| 32 | mixed only | 11.37 | 73.2 / 4460 | 28.6 / 33.2 | 65.5 |
+| 32 | **mixed + overlap** | **16.33** | 66.8 / **1211** | **17.2 / 22.5** | **44.8** |
+
+Offline throughput (same workload as above): baseline 4205 out tok/s → mixed + overlap **4701 out tok/s (+12%)**;
+mixed without overlap 4136. (Absolute numbers are ~10% lower than the table at the top because the GPU was also
+driving the desktop during this run; only same-day rows are compared.)
+
+The ablation is the interesting part: mixing alone is *slower*, because mixed steps run eagerly (no CUDA graph) and
+for a 0.6B model the ~300 kernel launches per step cost more than the GPU work. Overlap scheduling hides that host
+time behind the previous step, and only the combination wins — TPOT at 16 req/s halves and sustainable load rises
+from ~11 to ~16 req/s.
 
 **Kernels** ([`bench_kernels.py`](benchmarks/bench_kernels.py), full tables: [`kernels.md`](benchmarks/results/kernels.md)):
 
@@ -63,8 +88,9 @@ first item on the roadmap.
  asyncio event loop   │ AsyncEngine              │  thread-safe inbox / per-request asyncio queues
                       └────────────┬─────────────┘
  engine thread        ┌────────────▼─────────────┐
-                      │ Scheduler                │  prefill-first continuous batching, token budget,
-                      │                          │  chunked prefill, recompute preemption
+                      │ Scheduler                │  mixed prefill+decode steps in one token budget,
+                      │                          │  chunked prefill, recompute preemption,
+                      │                          │  overlap scheduling (CPU plans N+1 while GPU runs N)
                       │ BlockManager             │  paged KV blocks, chained-hash prefix cache, LRU eviction
                       └────────────┬─────────────┘
                       ┌────────────▼─────────────┐
@@ -97,9 +123,19 @@ All kernels are checked against eager PyTorch references in [`tests/test_kernels
 - **Prefix caching.** Each full block is keyed by `hash(parent_hash, tokens)`. Freed blocks keep their contents
   in an LRU free list and can be revived by a later request; unhashed tail blocks are evicted first. The block
   holding a prompt's last token is never shared, so a shared block is never written.
-- **Scheduling.** Prefill-first continuous batching with a per-step token budget. Prompts longer than the budget
-  are chunked across steps (the prefill kernel attends to the already-cached chunks). When blocks run out during
-  decode, the newest sequences are preempted and recomputed later (usually cheap thanks to the prefix cache).
+- **Mixed prefill/decode steps.** Each step fills one token budget: first one token for every decoding sequence,
+  then in-flight prompt chunks, then newly admitted prompts. All rows go through the same GEMMs; inside attention
+  the decode rows use the flash-decoding kernel and the prompt rows the varlen prefill kernel, so an arriving
+  prompt no longer stalls running decodes for a whole step. Prompts longer than the remaining budget are chunked
+  (the prefill kernel attends to the already-cached chunks). When blocks run out, the newest sequences are
+  preempted and recomputed later (usually cheap thanks to the prefix cache). Pure-decode steps replay CUDA graphs.
+- **Overlap scheduling.** The engine launches step N+1 before it waits for step N. Lengths, slots and block
+  allocation only depend on token *counts*, so step N+1 can be planned while step N's sampled tokens are still on
+  the GPU; their values are gathered into step N+1's inputs on the device. The host only learns them afterwards
+  (one pinned D2H copy + event per step), so stop-token checks lag by one step: a sequence that stopped at step
+  N has its step-N+1 token dropped. Sequences that will hit `max_tokens` are not scheduled for that extra step.
+  All host-to-device copies on the hot path are pinned and non-blocking, so the CPU never waits for the GPU to
+  drain. `--no-overlap-schedule` turns it off for ablation.
 - **CUDA graphs.** Decode steps for padded batch sizes {1, 2, 4, 8, 16, 32, …} are captured once; a step is then a
   few H2D copies plus one `graph.replay()`.
 
@@ -124,9 +160,9 @@ Benchmarks: `benchmarks/bench_kernels.py`, `benchmarks/bench_throughput.py --bac
 
 ## Limitations / roadmap
 
-- Each step is all-prefill or all-decode (vLLM-V0 style). Mixing them in one token budget (vLLM-V1 style) would fix
-  the TPOT gap under load shown above.
 - Prefill attention reaches ~85% of PyTorch SDPA (FlashAttention-2 backend); the remaining gap is mostly the
   64×64 tile with 4 warps and the per-tile block-table lookup. Larger tiles / more stages would close it.
-- Single GPU, bf16 only. Next: FP8 KV cache, weight-only int8/int4 GEMV for decode, speculative decoding,
+- Mixed steps run eagerly (only pure-decode steps replay CUDA graphs); a piecewise graph around attention would
+  remove that launch overhead for small mixed batches.
+- Single GPU, bf16 only. Next: speculative decoding, FP8 KV cache, weight-only int8/int4 GEMV for decode,
   tensor parallelism.

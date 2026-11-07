@@ -46,7 +46,6 @@ class ModelRunner:
                             dtype=torch.bfloat16, device="cuda")
         self.model.bind_kv_cache(dummy)
         meta = AttentionMetadata(
-            is_prefill=True,
             slot_mapping=torch.full((t,), -1, dtype=torch.long, device="cuda"),
             block_tables=torch.zeros(1, (t + self.bs - 1) // self.bs, dtype=torch.int32, device="cuda"),
             context_lens=torch.tensor([t], dtype=torch.int32, device="cuda"),
@@ -87,10 +86,38 @@ class ModelRunner:
         return num_blocks
 
     # ---- input preparation -------------------------------------------------------------------------------------
-    def _prepare_prefill(self, batch: ScheduledBatch):
+    def _decode_host_inputs(self, seqs, width: int):
+        """Host-side inputs for one query token per sequence. A token whose value is still on the GPU (overlap
+        scheduling) is entered as 0 and recorded in `gather` as (row, row of the previous step's output)."""
         bs = self.bs
-        input_ids, positions, slots, cu, ctx_lens, tables, sample_rows = [], [], [], [0], [], [], []
-        for seq, n in zip(batch.seqs, batch.num_tokens):
+        input_ids, positions, slots, ctx_lens, tables, gather = [], [], [], [], [], []
+        for i, seq in enumerate(seqs):
+            pos = seq.num_tokens - 1
+            if seq.num_inflight:
+                input_ids.append(0)
+                gather.append((i, seq.inflight_idx))
+            else:
+                input_ids.append(seq.token_ids[-1])
+            positions.append(pos)
+            slots.append(seq.block_table[pos // bs] * bs + pos % bs)
+            ctx_lens.append(seq.num_tokens)
+            tables.append(seq.block_table + [0] * (width - len(seq.block_table)))
+        return input_ids, positions, slots, ctx_lens, tables, gather
+
+    def _prepare_mixed(self, batch: ScheduledBatch):
+        """Eager inputs for a step that has prompt tokens (and possibly decodes in front of them)."""
+        bs, nd = self.bs, batch.num_decodes
+        dec = batch.seqs[:nd]
+        meta = AttentionMetadata(slot_mapping=None, num_decodes=nd)
+        input_ids, positions, slots, gather = [], [], [], []
+        if nd:
+            width = max(len(s.block_table) for s in dec)
+            input_ids, positions, slots, ctx, tables, gather = self._decode_host_inputs(dec, width)
+            meta.decode_block_tables = _to_gpu(tables, torch.int32)
+            meta.decode_context_lens = _to_gpu(ctx, torch.int32)
+            meta.num_partitions = ops.num_decode_partitions(max(ctx))
+        cu, ctx_lens, tables = [0], [], []
+        for seq, n in zip(batch.seqs[nd:], batch.num_tokens[nd:]):
             start, end = seq.num_computed_tokens, seq.num_computed_tokens + n
             input_ids.extend(seq.token_ids[start:end])
             positions.extend(range(start, end))
@@ -105,31 +132,13 @@ class ModelRunner:
             cu.append(cu[-1] + n)
             ctx_lens.append(end)
             tables.append(table)
-            if end == seq.num_tokens:
-                sample_rows.append(cu[-1] - 1)
         width = max(len(t) for t in tables)
-        tables = [t + [0] * (width - len(t)) for t in tables]
-        meta = AttentionMetadata(
-            is_prefill=True,
-            slot_mapping=_to_gpu(slots, torch.long),
-            block_tables=_to_gpu(tables, torch.int32),
-            context_lens=_to_gpu(ctx_lens, torch.int32),
-            cu_seqlens_q=_to_gpu(cu, torch.int32),
-            max_q_len=max(batch.num_tokens),
-        )
-        return _to_gpu(input_ids, torch.long), _to_gpu(positions, torch.long), meta, sample_rows
-
-    def _decode_host_inputs(self, batch: ScheduledBatch, width: int):
-        bs = self.bs
-        input_ids, positions, slots, ctx_lens, tables = [], [], [], [], []
-        for seq in batch.seqs:
-            pos = seq.num_tokens - 1
-            input_ids.append(seq.token_ids[-1])
-            positions.append(pos)
-            slots.append(seq.block_table[pos // bs] * bs + pos % bs)
-            ctx_lens.append(seq.num_tokens)
-            tables.append(seq.block_table + [0] * (width - len(seq.block_table)))
-        return input_ids, positions, slots, ctx_lens, tables
+        meta.block_tables = _to_gpu([t + [0] * (width - len(t)) for t in tables], torch.int32)
+        meta.context_lens = _to_gpu(ctx_lens, torch.int32)
+        meta.cu_seqlens_q = _to_gpu(cu, torch.int32)
+        meta.max_q_len = max(batch.num_tokens[nd:])
+        meta.slot_mapping = _to_gpu(slots, torch.long)
+        return _to_gpu(input_ids, torch.long), _to_gpu(positions, torch.long), meta, gather
 
     # ---- CUDA graphs for decode --------------------------------------------------------------------------------
     @torch.inference_mode()
@@ -148,8 +157,8 @@ class ModelRunner:
         pool = None
         for b in sorted(self.cfg.cuda_graph_batch_sizes, reverse=True):
             meta = AttentionMetadata(
-                is_prefill=False, slot_mapping=self.g_slots[:b], block_tables=self.g_tables[:b],
-                context_lens=self.g_ctx[:b], num_partitions=P, decode_tmp_out=self.g_tmp_out[:b],
+                slot_mapping=self.g_slots[:b], num_decodes=b, decode_block_tables=self.g_tables[:b],
+                decode_context_lens=self.g_ctx[:b], num_partitions=P, decode_tmp_out=self.g_tmp_out[:b],
                 decode_tmp_ml=self.g_tmp_ml[:b],
             )
             self.model(self.g_input_ids[:b], self.g_positions[:b], meta)  # warm up (cuBLAS handles, workspaces)
@@ -161,21 +170,32 @@ class ModelRunner:
         torch.cuda.synchronize()
         log.info("captured %d decode CUDA graphs (batch sizes %s)", len(self.graphs), self.cfg.cuda_graph_batch_sizes)
 
-    def _run_decode(self, batch: ScheduledBatch) -> torch.Tensor:
+    @staticmethod
+    def _apply_gather(ids: torch.Tensor, gather, prev_tokens: torch.Tensor | None):
+        """Fill in input tokens that were sampled by the previous (still running) step, on the device."""
+        if gather:
+            rows, src = zip(*gather)
+            ids[_to_gpu(list(rows), torch.long)] = prev_tokens[_to_gpu(list(src), torch.long)]
+
+    def _run_decode(self, batch: ScheduledBatch, prev_tokens) -> torch.Tensor:
         n = len(batch.seqs)
         graph_bs = next((b for b in sorted(self.graphs) if b >= n), None)
         if graph_bs is None:  # eager fallback
             width = max(len(s.block_table) for s in batch.seqs)
-            ids, pos, slots, ctx, tables = self._decode_host_inputs(batch, width)
+            ids, pos, slots, ctx, tables, gather = self._decode_host_inputs(batch.seqs, width)
             meta = AttentionMetadata(
-                is_prefill=False, slot_mapping=_to_gpu(slots, torch.long), block_tables=_to_gpu(tables, torch.int32),
-                context_lens=_to_gpu(ctx, torch.int32), num_partitions=ops.num_decode_partitions(max(ctx)),
+                slot_mapping=_to_gpu(slots, torch.long), num_decodes=n,
+                decode_block_tables=_to_gpu(tables, torch.int32), decode_context_lens=_to_gpu(ctx, torch.int32),
+                num_partitions=ops.num_decode_partitions(max(ctx)),
             )
-            return self.model(_to_gpu(ids, torch.long), _to_gpu(pos, torch.long), meta)
+            ids = _to_gpu(ids, torch.long)
+            self._apply_gather(ids, gather, prev_tokens)
+            return self.model(ids, _to_gpu(pos, torch.long), meta)
 
-        ids, pos, slots, ctx, tables = self._decode_host_inputs(batch, self.max_blocks_per_seq)
+        ids, pos, slots, ctx, tables, gather = self._decode_host_inputs(batch.seqs, self.max_blocks_per_seq)
         pad = graph_bs - n
         self.g_input_ids[:graph_bs].copy_(_to_gpu(ids + [0] * pad, torch.long))
+        self._apply_gather(self.g_input_ids, gather, prev_tokens)
         self.g_positions[:graph_bs].copy_(_to_gpu(pos + [0] * pad, torch.long))
         self.g_slots[:graph_bs].copy_(_to_gpu(slots + [-1] * pad, torch.long))
         self.g_ctx[:graph_bs].copy_(_to_gpu(ctx + [0] * pad, torch.int32))
@@ -186,17 +206,26 @@ class ModelRunner:
 
     # ---- step --------------------------------------------------------------------------------------------------
     @torch.inference_mode()
-    def run(self, batch: ScheduledBatch) -> list[int]:
-        """Returns one sampled token per sequence whose computation reached its last token this step."""
+    def run(self, batch: ScheduledBatch, prev_tokens: torch.Tensor | None = None):
+        """Launches one step without waiting for it. Returns (sampled token ids on the GPU, the sequences they belong
+        to): one token per sequence whose computation reaches its last token this step.
+
+        `prev_tokens` is the previous step's output; sequences with `num_inflight` read their input token from it."""
         if batch.is_prefill:
-            ids, pos, meta, rows = self._prepare_prefill(batch)
+            ids, pos, meta, gather = self._prepare_mixed(batch)
+            self._apply_gather(ids, gather, prev_tokens)
             hidden = self.model(ids, pos, meta)
+            rows, seqs, row = [], [], 0
+            for s, n in zip(batch.seqs, batch.num_tokens):
+                row += n
+                if s.num_computed_tokens + n == s.num_tokens:
+                    rows.append(row - 1)
+                    seqs.append(s)
             if not rows:
-                return []
-            hidden = hidden[torch.tensor(rows, device="cuda")]
-            seqs = [s for s, n in zip(batch.seqs, batch.num_tokens) if s.num_computed_tokens + n == s.num_tokens]
+                return None, []
+            hidden = hidden[_to_gpu(rows, torch.long)]
         else:
-            hidden = self._run_decode(batch)
+            hidden = self._run_decode(batch, prev_tokens)
             seqs = batch.seqs
         logits = self.model.compute_logits(hidden)
-        return self.sampler(logits, [s.params for s in seqs]).tolist()
+        return self.sampler(logits, [s.params for s in seqs]), seqs

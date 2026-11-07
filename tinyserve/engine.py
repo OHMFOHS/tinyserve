@@ -3,6 +3,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import torch
+
 from tinyserve.block_manager import BlockManager
 from tinyserve.config import EngineConfig, ModelConfig
 from tinyserve.model_runner import ModelRunner
@@ -24,7 +26,8 @@ def resolve_model_path(model: str) -> str:
 @dataclass
 class EngineStats:
     steps: int = 0
-    prefill_steps: int = 0
+    prefill_steps: int = 0  # steps that computed any prompt tokens (they may carry decodes too)
+    mixed_steps: int = 0  # steps that computed prompt tokens and decode tokens together
     prompt_tokens: int = 0  # computed prompt tokens (excludes prefix-cache hits)
     generated_tokens: int = 0
 
@@ -47,6 +50,7 @@ class LLMEngine:
         if self.tokenizer.eos_token_id is not None:
             self.eos_ids.add(self.tokenizer.eos_token_id)
         self.stats = EngineStats()
+        self._inflight: _InflightStep | None = None
 
     def add_request(self, prompt: str | list[int], params: SamplingParams, request_id: str | None = None) -> Sequence:
         ids = self.tokenizer.encode(prompt) if isinstance(prompt, str) else list(prompt)
@@ -62,29 +66,57 @@ class LLMEngine:
         return self.scheduler.abort(request_id)
 
     def has_unfinished(self) -> bool:
-        return self.scheduler.has_unfinished()
+        return self.scheduler.has_unfinished() or self._inflight is not None
 
     def step(self) -> list[Sequence]:
-        """Run one scheduler step; returns the sequences that received a new token (finished ones included)."""
+        """Run one scheduler step; returns the sequences that received a new token (finished ones included).
+
+        With overlap scheduling the step launched here is only resolved by the next call: this call schedules and
+        launches step N+1, then waits for step N, whose GPU work ran while the CPU was busy with N+1. The sampled
+        tokens of step N feed step N+1 on the device, so the GPU never idles waiting for the host."""
         batch = self.scheduler.schedule()
-        if batch is None:
-            if self.scheduler.waiting:
+        launched = self._launch(batch) if batch is not None else None
+        if not self.cfg.enable_overlap_schedule:
+            done, self._inflight = launched, None
+        else:
+            done, self._inflight = self._inflight, launched
+        if done is None:
+            if launched is None and self.scheduler.waiting:
                 raise RuntimeError("cannot schedule: a waiting request does not fit in the KV cache")
             return []
-        new_tokens = self.runner.run(batch)
-        now = time.perf_counter()
+        return self._resolve(done)
+
+    def _launch(self, batch) -> "_InflightStep":
+        prev = self._inflight.tokens if self._inflight is not None else None
+        tokens, sampled = self.runner.run(batch, prev)
         self.stats.steps += 1
         if batch.is_prefill:
             self.stats.prefill_steps += 1
-            self.stats.prompt_tokens += sum(batch.num_tokens)
-        updated = []
-        it = iter(new_tokens)
+            self.stats.mixed_steps += batch.num_decodes > 0
+            self.stats.prompt_tokens += batch.num_prefill_tokens
         for seq, n in zip(batch.seqs, batch.num_tokens):
             seq.num_computed_tokens += n
-            self.block_manager.register_computed_blocks(seq)
-            if seq.num_computed_tokens < seq.num_tokens:
-                continue  # chunked prefill, more to go
-            tok = next(it)
+        for i, seq in enumerate(sampled):  # the sampled token now exists, its value is still on the GPU
+            seq.num_inflight += 1
+            seq.inflight_idx = i
+        host = event = None
+        if tokens is not None:
+            host = torch.empty(tokens.shape, dtype=tokens.dtype, pin_memory=True)
+            host.copy_(tokens, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+        return _InflightStep(batch.seqs, sampled, tokens, host, event)
+
+    def _resolve(self, step: "_InflightStep") -> list[Sequence]:
+        if step.event is not None:
+            step.event.synchronize()
+        now = time.perf_counter()
+        updated = []
+        values = step.host.tolist() if step.host is not None else []
+        for seq, tok in zip(step.sampled, values):
+            seq.num_inflight -= 1
+            if seq.is_finished:  # finished (or aborted) while this step was in flight: drop the extra token
+                continue
             seq.token_ids.append(tok)
             self.stats.generated_tokens += 1
             if seq.first_token_time is None:
@@ -94,15 +126,27 @@ class LLMEngine:
                 seq.finish_time = now
                 self.scheduler.finish(seq, reason)
             updated.append(seq)
+        for seq in step.seqs:
+            if not seq.is_finished:
+                self.block_manager.register_computed_blocks(seq)
         return updated
 
     def _finish_reason(self, seq: Sequence, tok: int) -> str | None:
         p = seq.params
         if not p.ignore_eos and (tok in self.eos_ids or tok in p.stop_token_ids):
             return "stop"
-        if seq.num_completion_tokens >= p.max_tokens or seq.num_tokens >= self.cfg.max_model_len:
+        if seq.num_completion_tokens >= p.max_tokens or len(seq.token_ids) >= self.cfg.max_model_len:
             return "length"
         return None
+
+
+@dataclass
+class _InflightStep:
+    seqs: list[Sequence]
+    sampled: list[Sequence]  # sequences that get a token from this step, in the order of `tokens`
+    tokens: torch.Tensor | None  # sampled ids on the GPU (input of the next step's in-flight tokens)
+    host: torch.Tensor | None  # pinned copy, valid once `event` completes
+    event: torch.cuda.Event | None
 
 
 class LLM:

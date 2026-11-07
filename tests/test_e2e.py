@@ -60,8 +60,9 @@ def check_against_hf(hf, tokenizer, prompts, outputs, min_argmax_rate=0.95):
         dict(),  # CUDA graphs + prefix caching
         dict(enforce_eager=True, enable_prefix_caching=False),
         dict(max_num_batched_tokens=16),  # forces chunked prefill on every prompt
+        dict(enable_overlap_schedule=False),
     ],
-    ids=["default", "eager-nocache", "chunked"],
+    ids=["default", "eager-nocache", "chunked", "no-overlap"],
 )
 def test_matches_hf_greedy(hf, engine_kwargs):
     from tinyserve import LLM, SamplingParams
@@ -76,5 +77,38 @@ def test_matches_hf_greedy(hf, engine_kwargs):
         assert sum(o["num_cached_tokens"] for o in again) > 0
         check_against_hf(hf, llm.tokenizer, PROMPTS, again)
     del llm, outs
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("overlap", [True, False], ids=["overlap", "no-overlap"])
+def test_staggered_arrivals_mixed_steps(hf, overlap):
+    """Requests arrive while others decode, so prompt chunks and decodes share steps; one request hits a stop token."""
+    from tinyserve import LLM, SamplingParams
+
+    llm = LLM(MODEL, max_model_len=1024, max_num_seqs=8, gpu_memory_utilization=0.6, max_num_batched_tokens=48,
+              enable_overlap_schedule=overlap)
+    eng = llm.engine
+    greedy = SamplingParams(temperature=0, max_tokens=40, ignore_eos=True)
+    seqs = []
+    for i, prompt in enumerate(PROMPTS):
+        seqs.append(eng.add_request(prompt, greedy))
+        for _ in range(3 + i):
+            eng.step()
+    comma = llm.tokenizer.encode(",")[-1]
+    short = eng.add_request("1, 1, 2, 3, 5, 8, 13,", SamplingParams(temperature=0, max_tokens=200,
+                                                                    stop_token_ids=[comma]))
+    sampled = eng.add_request(PROMPTS[0], SamplingParams(temperature=0.8, top_p=0.9, top_k=50, max_tokens=17))
+    while eng.has_unfinished():
+        eng.step()
+    assert eng.stats.mixed_steps > 0
+    outs = [{"token_ids": s.completion_token_ids} for s in seqs]
+    assert all(len(o["token_ids"]) == 40 for o in outs)
+    check_against_hf(hf, llm.tokenizer, PROMPTS, outs)
+    assert short.finish_reason == "stop" and short.completion_token_ids[-1] == comma
+    assert comma not in short.completion_token_ids[:-1]  # nothing generated past the stop token survives
+    assert len(sampled.completion_token_ids) == 17 and sampled.finish_reason == "length"
+    assert eng.block_manager.num_free_blocks == eng.block_manager.num_blocks  # everything released
+    del llm, eng
     gc.collect()
     torch.cuda.empty_cache()

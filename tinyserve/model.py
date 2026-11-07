@@ -18,15 +18,27 @@ from tinyserve.reference import rope_cos_sin_cache
 
 @dataclass
 class AttentionMetadata:
-    is_prefill: bool
+    """Paged-attention addressing for one step. Tokens are laid out decodes first: rows [0, num_decodes) are one
+    query token per decoding sequence (served by the flash-decoding kernel), the remaining rows are the prompt
+    chunks of the prefilling sequences (served by the varlen prefill kernel). Either part may be empty."""
+
     slot_mapping: torch.Tensor  # [T] int64, -1 = padding
-    block_tables: torch.Tensor  # [B, max_blocks] int32
-    context_lens: torch.Tensor  # [B] int32, kv length including this step's tokens
-    cu_seqlens_q: torch.Tensor | None = None  # prefill only: [B+1] int32
-    max_q_len: int = 0  # prefill only
-    num_partitions: int = 1  # decode only
+    num_decodes: int = 0
+    # decode part
+    decode_block_tables: torch.Tensor | None = None  # [num_decodes, max_blocks] int32
+    decode_context_lens: torch.Tensor | None = None  # [num_decodes] int32, kv length including this token
+    num_partitions: int = 1
     decode_tmp_out: torch.Tensor | None = None
     decode_tmp_ml: torch.Tensor | None = None
+    # prefill part
+    block_tables: torch.Tensor | None = None  # [P, max_blocks] int32
+    context_lens: torch.Tensor | None = None  # [P] int32, kv length including this step's tokens
+    cu_seqlens_q: torch.Tensor | None = None  # [P+1] int32, offsets relative to the first prefill row
+    max_q_len: int = 0
+
+    @property
+    def has_prefill(self) -> bool:
+        return self.cu_seqlens_q is not None
 
 
 class Qwen3Model(torch.nn.Module):
@@ -109,13 +121,15 @@ class Qwen3Model(torch.nn.Module):
         v = qkv[:, (hq + hk) * d:].view(t, hk, d)
         k_cache, v_cache = self.kv_caches[layer_idx]
         ops.reshape_and_cache(k, v, k_cache, v_cache, meta.slot_mapping)
-        if meta.is_prefill:
-            o = ops.paged_prefill_attention(q, k_cache, v_cache, meta.block_tables, meta.cu_seqlens_q,
-                                            meta.context_lens, meta.max_q_len, self.scale)
-        else:
-            o = torch.empty(t, hq, d, dtype=h.dtype, device=h.device)
-            ops.paged_decode_attention(o, q, k_cache, v_cache, meta.block_tables, meta.context_lens, self.scale,
-                                       meta.num_partitions, meta.decode_tmp_out, meta.decode_tmp_ml)
+        nd = meta.num_decodes
+        o = torch.empty(t, hq, d, dtype=h.dtype, device=h.device)
+        if nd:
+            ops.paged_decode_attention(o[:nd], q[:nd], k_cache, v_cache, meta.decode_block_tables,
+                                       meta.decode_context_lens, self.scale, meta.num_partitions,
+                                       meta.decode_tmp_out, meta.decode_tmp_ml)
+        if meta.has_prefill:
+            ops.paged_prefill_attention(q[nd:], k_cache, v_cache, meta.block_tables, meta.cu_seqlens_q,
+                                        meta.context_lens, meta.max_q_len, self.scale, out=o[nd:])
         return F.linear(o.view(t, hq * d), L["o"])
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, meta: AttentionMetadata) -> torch.Tensor:

@@ -114,7 +114,9 @@ class BlockManager:
         """Publish newly completed full blocks to the prefix cache (prompt and generated tokens alike)."""
         if not self.enable_prefix_caching:
             return
-        n_full = seq.num_computed_tokens // self.block_size
+        # A block can only be hashed once all of its token values are on the host (overlap scheduling may have
+        # computed KV for a token whose value has not been copied back yet).
+        n_full = min(seq.num_computed_tokens, len(seq.token_ids)) // self.block_size
         if n_full <= seq.num_hashed_blocks:
             return
         self._ensure_hashes(seq, n_full)

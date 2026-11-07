@@ -56,6 +56,7 @@ class EngineConfig:
     gpu_memory_utilization: float = 0.85  # fraction of total GPU memory the engine may use
     enable_prefix_caching: bool = True
     enforce_eager: bool = False  # disable CUDA graphs for decode
+    enable_overlap_schedule: bool = True  # schedule step N+1 on the CPU while the GPU runs step N
     num_kv_blocks: int | None = None  # override the automatic KV cache sizing
     cuda_graph_batch_sizes: list[int] = field(default_factory=list)
 

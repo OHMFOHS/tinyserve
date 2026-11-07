@@ -107,3 +107,36 @@ def test_preemption_when_cache_is_full():
     batch = sched.schedule()
     assert sched.num_preemptions >= 1
     assert b in sched.waiting and a in sched.running
+
+
+def test_new_prompt_rides_along_with_running_decodes():
+    cfg = EngineConfig(model="x", max_num_batched_tokens=8, max_num_seqs=4)
+    bm = BlockManager(64, BS)
+    sched = Scheduler(cfg, bm)
+    a = seq(range(5))
+    sched.add(a)
+    simulate_step(sched, sched.schedule(), bm)  # a is now decoding
+    b = seq(range(100, 120))  # 20-token prompt, longer than the budget
+    sched.add(b)
+    batch = sched.schedule()
+    assert batch.num_decodes == 1 and batch.seqs == [a, b] and batch.num_tokens == [1, 7]
+    assert batch.is_prefill and batch.num_prefill_tokens == 7
+    simulate_step(sched, batch, bm)
+    batch = sched.schedule()  # a keeps decoding every step while b's prompt is chunked
+    assert batch.seqs == [a, b] and batch.num_tokens == [1, 7]
+
+
+def test_inflight_token_counts_towards_length():
+    cfg = EngineConfig(model="x", max_num_batched_tokens=64, max_num_seqs=4)
+    bm = BlockManager(64, BS)
+    sched = Scheduler(cfg, bm)
+    a = seq(range(6), max_tokens=2)
+    sched.add(a)
+    batch = sched.schedule()
+    a.num_computed_tokens += 6
+    a.num_inflight = 1  # first token sampled, value not copied back yet
+    batch = sched.schedule()
+    assert batch.seqs == [a] and batch.num_tokens == [1]
+    a.num_computed_tokens += 1
+    a.num_inflight = 2  # second (= max_tokens-th) token in flight: no further step for `a`
+    assert sched.schedule() is None
